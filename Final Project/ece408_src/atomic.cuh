@@ -43,24 +43,23 @@ __global__ void reduction_forward_kernel(float *y, const float *x, const float *
  
     int n = blockIdx.x;
     int m = blockIdx.y;
-    int c = blockIdx.z + threadIdx.x;
-    int h = blockIdx.z + threadIdx.y;
-    int w = blockIdx.z + threadIdx.z;
-    int t = c * K * K + i * K + j;
+    int h = blockIdx.z / W_out;
+    int w = blockIdx.z % W_out;
+    int c = threadIdx.x;
+    int i = threadIdx.y;
+    int j = threadIdx.z;
     //Represents for which output channel
-    int outputC = blockIdx.z;
+    int t = threadIdx.x * K * K + threadIdx.y * K + threadIdx.z;
 
     float curRes = 0;
 
     if(h < H_out && w < W_out) {
 
-        for(int i = 0; i < K; ++i) {
-            for(int j = 0; j < K; ++j) {
-                if(h + i >= 0 && h + i < H && w + j >= 0 && w + j < W)
-                    SM[t] += x4d(n, c, h + i, w + j) * k4d(m, c, i, j); 
-            }
-        }
+        curRes += x4d(n, c, h + i, w + j) * k4d(m, c, i, j); 
+        atomicAdd(&SM[0], curRes);
         
+        __syncthreads();
+
         for(int stride = ceil(C * K * K) / 2; stride > 0; stride >>= 1) {
             __syncthreads();
 
@@ -98,10 +97,6 @@ __global__ void atomic_forward_kernel(float *y, const float *x, const float *k, 
     //const int K = k.shape_[3]; filter size
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
-    (void)H_out; // silence declared but never referenced warning. remove this line when you start working
-    (void)W_out; // silence declared but never referenced warning. remove this line when you start working
-    const int W_grid = ceil(1.0 * W_out / TILE_WIDTH);
-    const int H_grid = ceil(1.0 * H_out / TILE_WIDTH);
 
 // An example use of these macros:
 // float a = y4d(0,0,0,0)
@@ -112,9 +107,11 @@ __global__ void atomic_forward_kernel(float *y, const float *x, const float *k, 
  
     int n = blockIdx.x;
     int m = blockIdx.y;
-    int c = blockIdx.z + threadIdx.x;
-    int h = blockIdx.z + threadIdx.y;
-    int w = blockIdx.z + threadIdx.z;
+    int h = blockIdx.z / W_out;
+    int w = blockIdx.z % W_out;
+    int c = threadIdx.x;
+    int i = threadIdx.y;
+    int j = threadIdx.z;
 
     //Represents for which output channel
     int outputC = blockIdx.z;
@@ -123,15 +120,12 @@ __global__ void atomic_forward_kernel(float *y, const float *x, const float *k, 
 
     if(h < H_out && w < W_out) {
 
-        for(int i = 0; i < K; ++i) {
-            for(int j = 0; j < K; ++j) {
-                if(h + i >= 0 && h + i < H && w + j >= 0 && w + j < W)
-                    curRes += x4d(n, c, h + i, w + j) * k4d(m, c, i, j); 
-            }
-            atomicAdd(&SM[0], curRes);
-        }
+        curRes += x4d(n, c, h + i, w + j) * k4d(m, c, i, j); 
+        atomicAdd(&SM[0], curRes);
         
-        atomicAdd(&y4d(n, m, h, w), SM[0]);
+        __syncthreads();
+        if(threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0)
+            y4d(n, m, h, w) = SM[0];
     }
     
 
@@ -167,11 +161,11 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     int H_grid = ceil(1.0 * H_out / TILE_WIDTH);
     int Z = H_grid * W_grid;
     // Set the kernel dimensions
-    dim3 gridDim(B, M, H_out * W_out);
-    dim3 blockDim(C, K, K);
+    dim3 gridDim(B, M, H_out * W_out, TILE_WIDTH);
+    dim3 blockDim(C / TILE_WIDTH, K, K);
  
     // Call the reduction kernel
-    reduction_forward_kernel<<<gridDim, blockDim>>>(y.dptr_,x.dptr_,w.dptr_, B,M,C,H,W,K);
+    // reduction_forward_kernel<<<gridDim, blockDim>>>(y.dptr_,x.dptr_,w.dptr_, B,M,C,H,W,K);
     atomic_forward_kernel<<<gridDim, blockDim>>>(y.dptr_,x.dptr_,w.dptr_, B,M,C,H,W,K);
     // Use MSHADOW_CUDA_CALL to check for CUDA runtime errors.
     MSHADOW_CUDA_CALL(cudaDeviceSynchronize());
