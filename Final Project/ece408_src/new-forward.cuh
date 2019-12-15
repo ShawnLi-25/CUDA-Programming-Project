@@ -9,9 +9,9 @@ namespace mxnet
 namespace op
 {
  
-__global__ void forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
+__global__ void atomic_forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
- 
+    __shared__ float SM[1];
     /*
     Modify this function to implement the forward pass described in Chapter 16.
     We have added an additional dimension to the tensors to support an entire mini-batch
@@ -43,30 +43,94 @@ __global__ void forward_kernel(float *y, const float *x, const float *k, const i
  
     int n = blockIdx.x;
     int m = blockIdx.y;
-    int h = (blockIdx.z / W_grid) * TILE_WIDTH + threadIdx.x;
-    int w = (blockIdx.z % W_grid) * TILE_WIDTH + threadIdx.y;
+    int h = blockIdx.z + threadIdx.y;
+    int w = blockIdx.z + threadIdx.z;
+
+    //Represents for which output channel
+    int outputC = blockIdx.z;
+
     float curRes = 0;
 
     if(h < H_out && w < W_out) {
 
-        for(int c = 0; c < C; ++c) {
-            for(int i = 0; i < K; ++i) {
-                for(int j = 0; j < K; ++j) {
-        
-                    if(h + i >= 0 && h + i < H && w + j >= 0 && w + j < W)
-                        curRes += x4d(n, c, h + i, w + j) * k4d(m, c, i, j); 
-                }
+        for(int i = 0; i < K; ++i) {
+            for(int j = 0; j < K; ++j) {
+                if(h + i >= 0 && h + i < H && w + j >= 0 && w + j < W)
+                    curRes += x4d(n, c, h + i, w + j) * k4d(m, c, i, j); 
             }
+            atomicAdd(&SM[0], curRes);
         }
         
-        y4d(n, m, h, w) = curRes;
+        atomicAdd(&y4d(n, m, h, w), SM[0]);
     }
     
 
 #undef y4d
 #undef x4d
-#undef k4d
+#undef k4   
 }
+
+__global__ void reduction_forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
+{
+    __shared__ float SM[1];
+    /*
+    Modify this function to implement the forward pass described in Chapter 16.
+    We have added an additional dimension to the tensors to support an entire mini-batch
+    The goal here is to be correct AND fast.
+    We have some nice #defs for you below to simplify indexing. Feel free to use them, or create your own.
+    */
+    // y: output  B x M x H_out x W_out
+    // x: input   B x C x H x W
+    // k: filter  M x C x K x K
+    //const int B = x.shape_[0]; batch size
+    //const int M = y.shape_[1]; output channel
+    //const int C = x.shape_[1]; input channel
+    //const int H = x.shape_[2]; input height
+    //const int W = x.shape_[3]; input width
+    //const int K = k.shape_[3]; filter size
+    const int H_out = H - K + 1;
+    const int W_out = W - K + 1;
+    (void)H_out; // silence declared but never referenced warning. remove this line when you start working
+    (void)W_out; // silence declared but never referenced warning. remove this line when you start working
+    const int W_grid = ceil(1.0 * W_out / TILE_WIDTH);
+    const int H_grid = ceil(1.0 * H_out / TILE_WIDTH);
+
+// An example use of these macros:
+// float a = y4d(0,0,0,0)
+// y4d(0,0,0,0) = a
+#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
+#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
+#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+ 
+    int n = blockIdx.x;
+    int m = blockIdx.y;
+    int h = blockIdx.z + threadIdx.y;
+    int w = blockIdx.z + threadIdx.z;
+
+    //Represents for which output channel
+    int outputC = blockIdx.z;
+
+    float curRes = 0;
+
+    if(h < H_out && w < W_out) {
+
+        for(int i = 0; i < K; ++i) {
+            for(int j = 0; j < K; ++j) {
+                if(h + i >= 0 && h + i < H && w + j >= 0 && w + j < W)
+                    curRes += x4d(n, c, h + i, w + j) * k4d(m, c, i, j); 
+            }
+            atomicAdd(&SM[0], curRes);
+        }
+        
+        atomicAdd(&y4d(n, m, h, w), SM[0]);
+    }
+    
+
+#undef y4d
+#undef x4d
+#undef k4   
+}
+
  
 /* 
    This function is called by new-inl.h
@@ -94,8 +158,8 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     int H_grid = ceil(1.0 * H_out / TILE_WIDTH);
     int Z = H_grid * W_grid;
     // Set the kernel dimensions
-    dim3 gridDim(B, M, Z);
-    dim3 blockDim(TILE_WIDTH,TILE_WIDTH,1);
+    dim3 gridDim(B, M, H_out * W_out);
+    dim3 blockDim(C, K, K);
  
     // Call the kernel
     forward_kernel<<<gridDim, blockDim>>>(y.dptr_,x.dptr_,w.dptr_, B,M,C,H,W,K);
