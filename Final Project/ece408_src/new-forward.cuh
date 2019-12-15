@@ -11,7 +11,7 @@ namespace op
  
 __global__ void atomic_forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
-    __shared__ float SM[1];
+    __shared__ float SM[C * K * K];
     /*
     Modify this function to implement the forward pass described in Chapter 16.
     We have added an additional dimension to the tensors to support an entire mini-batch
@@ -43,9 +43,10 @@ __global__ void atomic_forward_kernel(float *y, const float *x, const float *k, 
  
     int n = blockIdx.x;
     int m = blockIdx.y;
+    int c = blockIdx.z + threadIdx.x;
     int h = blockIdx.z + threadIdx.y;
     int w = blockIdx.z + threadIdx.z;
-
+    int t = c * K * K + i * K + j;
     //Represents for which output channel
     int outputC = blockIdx.z;
 
@@ -56,14 +57,21 @@ __global__ void atomic_forward_kernel(float *y, const float *x, const float *k, 
         for(int i = 0; i < K; ++i) {
             for(int j = 0; j < K; ++j) {
                 if(h + i >= 0 && h + i < H && w + j >= 0 && w + j < W)
-                    curRes += x4d(n, c, h + i, w + j) * k4d(m, c, i, j); 
+                    SM[t] += x4d(n, c, h + i, w + j) * k4d(m, c, i, j); 
             }
-            atomicAdd(&SM[0], curRes);
         }
         
-        atomicAdd(&y4d(n, m, h, w), SM[0]);
+        for(int stride = ceil(C * K * K) / 2; stride > 0; stride >>= 1) {
+            __syncthreads();
+
+            if(t < stride) {
+                SM[t] += SM[t + stride];
+            }
+        }
     }
     
+    if(t == 0)
+        y4d(n, m, h, w) = SM[t];
 
 #undef y4d
 #undef x4d
@@ -104,6 +112,7 @@ __global__ void reduction_forward_kernel(float *y, const float *x, const float *
  
     int n = blockIdx.x;
     int m = blockIdx.y;
+    int c = blockIdx.z + threadIdx.x;
     int h = blockIdx.z + threadIdx.y;
     int w = blockIdx.z + threadIdx.z;
 
