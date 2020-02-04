@@ -1,6 +1,6 @@
-# Final Projects for ECE408
+# Course Projects for ECE408
 
-## Implementation 
+## Final Project Implementation 
 + Tiled Convolution using Shared Memory 
 + Unrolling Strategy
 + Register Tiling
