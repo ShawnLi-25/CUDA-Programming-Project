@@ -1,4 +1,5 @@
-# Course Projects for ECE408
+# ECE408 Applied Parallel Programming
+# Course Projects 
 
 ## Final Project Implementation 
 + Tiled Convolution using Shared Memory 
